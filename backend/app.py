@@ -1,110 +1,60 @@
 """
-backend/app.py
-FastAPI backend service for MNIST Handwritten Digit Recognition.
-Handles both canvas drawings and uploaded images via POST /predict.
+backend/model_service.py
+Loads the trained MNIST Keras model once at server startup and provides
+fast, real-time inference returning prediction, confidence, and class probabilities.
 """
+import os
+import numpy as np
+import tensorflow as tf
 
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from backend.preprocessing import preprocess_image
-from backend.model_service import get_model_service
+class ModelService:
+    def __init__(self, model_path: str = "model/mnist_model.h5"):
+        self.model_path = model_path
+        self.model = None
+        self.load_model()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Preload the ML model on server startup
-    try:
-        get_model_service()
-        print("Backend startup complete. Model ready for inference.")
-    except Exception as e:
-        print(f"Warning during model initialization: {e}")
-    yield
-
-app = FastAPI(
-    title="DigitNet — Handwritten Digit Recognition API",
-    description="FastAPI backend connecting frontend canvas & image upload to MNIST model.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-# Configure CORS to allow frontend communication across localhost ports
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint to verify backend and model readiness."""
-    try:
-        service = get_model_service()
-        model_loaded = service.model is not None
-    except Exception:
-        model_loaded = False
-
-    return {
-        "status": "healthy" if model_loaded else "degraded",
-        "model_loaded": model_loaded,
-        "message": "DigitNet ML Backend is running",
-    }
-
-@app.post("/predict")
-async def predict_digit(file: UploadFile = File(...)):
-    """
-    Accepts an uploaded image or canvas drawing (PNG, JPG, JPEG)
-    and returns the model prediction, confidence, and probabilities.
-    """
-    # 1. Validate file format
-    allowed_types = ["image/png", "image/jpeg", "image/jpg", "application/octet-stream"]
-    if file.content_type and file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported file format. Please upload a PNG, JPG, or JPEG image.",
-        )
-
-    # 2. Read image bytes
-    try:
-        image_bytes = await file.read()
-        if not image_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="Please draw a digit or upload an image first.",
+    def load_model(self):
+        """Loads the trained model once from disk."""
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(
+                f"Model file not found at {self.model_path}. "
+                "Please run `python train_model.py` first."
             )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to read uploaded file: {str(e)}",
-        )
+        print(f"Loading trained MNIST model from {self.model_path}...")
+        self.model = tf.keras.models.load_model(self.model_path)
+        print("MNIST model loaded successfully!")
 
-    # 3. Preprocess image
-    try:
-        tensor, preview_base64 = preprocess_image(image_bytes)
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=400,
-            detail=str(ve),
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error processing image: {str(e)}",
-        )
+    def predict(self, input_tensor: np.ndarray) -> dict:
+        """
+        Runs real inference on a preprocessed (1, 28, 28) image tensor.
 
-    # 4. Run model inference
-    try:
-        service = get_model_service()
-        result = service.predict(tensor)
-        result["preview"] = preview_base64
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}",
-        )
+        Returns:
+            dict containing:
+            - prediction: int (0-9)
+            - digit: int (0-9)
+            - confidence: float (0.0-1.0)
+            - probabilities: list[float] (length 10, sum to 1.0)
+        """
+        if self.model is None:
+            raise RuntimeError("Model is not loaded.")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("backend.app:app", host="0.0.0.0", port=8000, reload=True)
+        # Real model prediction - inference mode
+        raw_probs = self.model(input_tensor, training=False).numpy()[0]
+        predicted_digit = int(np.argmax(raw_probs))
+        confidence = float(np.max(raw_probs))
+        probabilities = [round(float(p), 2) for p in raw_probs]
+
+        return {
+            "prediction": predicted_digit,
+            "digit": predicted_digit,
+            "confidence": round(confidence, 4),
+            "probabilities": probabilities,
+        }
+
+# Global singleton instance
+_model_service = None
+
+def get_model_service() -> ModelService:
+    global _model_service
+    _model_service = ModelService()
+    return _model_service
